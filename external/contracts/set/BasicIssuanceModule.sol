@@ -43,6 +43,15 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
     using SafeMath for uint256;
     using SafeCast for int256;
 
+    /* ============ Structs ============ */
+
+    // NOTE: moduleIssuanceHooks uses address[] for compatibility with AddressArrayUtils library
+    struct IssuanceSettings {
+        IManagerIssuanceHook managerIssuanceHook;       // Instance of manager defined hook, can hold arbitrary logic
+        address[] moduleIssuanceHooks;                  // Array of modules that are registered with this module
+        mapping(address => bool) isModuleHook;          // Mapping of modules to if they've registered a hook
+    }
+
     /* ============ Events ============ */
 
     event SetTokenIssued(
@@ -56,13 +65,13 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
         address indexed _setToken,
         address indexed _redeemer,
         address indexed _to,
+        address _hookContract,
         uint256 _quantity
     );
 
     /* ============ State Variables ============ */
 
-    // Mapping of SetToken to Issuance hook configurations
-    mapping(ISetToken => IManagerIssuanceHook) public managerIssuanceHook;
+    mapping(ISetToken => IssuanceSettings) public issuanceSettings;
 
     /* ============ Constructor ============ */
 
@@ -94,7 +103,9 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
     {
         require(_quantity > 0, "Issue quantity must be > 0");
 
-        address hookContract = _callPreIssueHooks(_setToken, _quantity, msg.sender, _to);
+        address hookContract = _callManagerPreIssueHooks(_setToken, _quantity, msg.sender, _to);
+
+        _callModulePreIssueHooks(_setToken, _quantity);
 
         (
             address[] memory components,
@@ -118,7 +129,7 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
         emit SetTokenIssued(address(_setToken), msg.sender, _to, hookContract, _quantity);
     }
 
-    /**
+     /**
      * Redeems the SetToken's positions and sends the components of the given
      * quantity to the caller. This function only handles Default Positions (positionState = 0).
      *
@@ -132,10 +143,15 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
         address _to
     )
         external
+        override
         nonReentrant
         onlyValidAndInitializedSet(_setToken)
     {
         require(_quantity > 0, "Redeem quantity must be > 0");
+
+        address hookContract = _callManagerPreRedeemHooks(_setToken, _quantity, msg.sender, _to);
+
+        _callModulePreRedeemHooks(_setToken, _quantity);
 
         // Burn the SetToken - ERC20's internal burn already checks that the user has enough balance
         _setToken.burn(msg.sender, _quantity);
@@ -159,7 +175,7 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
             );
         }
 
-        emit SetTokenRedeemed(address(_setToken), msg.sender, _to, _quantity);
+        emit SetTokenRedeemed(address(_setToken), msg.sender, _to, hookContract, _quantity);
     }
 
     /**
@@ -183,11 +199,37 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
     }
 
     /**
-     * Reverts as this module should not be removable after added. Users should always
-     * have a way to redeem their Sets
+     * SET TOKEN ONLY: Allows removal (and deletion of state) of BasicIssuanceModuleV2
      */
     function removeModule() external override {
-        revert("The BasicIssuanceModule module cannot be removed");
+        require(issuanceSettings[ISetToken(msg.sender)].moduleIssuanceHooks.length == 0, "Registered modules must be removed.");
+        delete issuanceSettings[ISetToken(msg.sender)];
+    }
+
+    /**
+     * MANAGER ONLY: Updates the address of the manager issuance hook. To remove the hook
+     * set the new hook address to address(0)
+     *
+     * @param _setToken         Instance of the SetToken to update manager hook
+     * @param _newHook          New manager hook contract address
+     */
+    function updateManagerIssuanceHook(
+        ISetToken _setToken,
+        IManagerIssuanceHook _newHook
+    )
+        external
+        onlySetManager(_setToken, msg.sender)
+        onlyValidAndInitializedSet(_setToken)
+    {
+        managerIssuanceHook[_setToken] = _newHook;
+    }
+
+    function getModuleIssuanceHooks(ISetToken _setToken) external view returns(address[] memory) {
+        return issuanceSettings[_setToken].moduleIssuanceHooks;
+    }
+
+    function isModuleIssuanceHook(ISetToken _setToken, address _hook) external view returns(bool) {
+        return issuanceSettings[_setToken].isModuleHook[_hook];
     }
 
     /* ============ External Getter Functions ============ */
@@ -200,7 +242,7 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
      * @return address[]            List of component addresses
      * @return uint256[]            List of component units required to issue the quantity of SetTokens
      */
-    function getRequiredComponentUnitsForIssue(
+    function getRequiredComponentIssuanceUnits(
         ISetToken _setToken,
         uint256 _quantity
     )
@@ -209,26 +251,61 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
         onlyValidAndInitializedSet(_setToken)
         returns (address[] memory, uint256[] memory)
     {
+        return _calculateRequiredComponentIssuanceUnits(_setToken, totalQuantity, true);
+    }
+
+    /**
+     * Calculates the amount of each component will be returned on redemption.
+     * redeem Values DO NOT take into account any updates from pre action manager or module hooks.
+     *
+     * @param _setToken         Instance of the SetToken to redeem
+     * @param _quantity         Amount of Sets to be redeemed
+     *
+     * @return address[]        Array of component addresses making up the Set
+     * @return uint256[]        Array of equity notional amounts of each component, respectively, represented as uint256
+     */
+    function getRequiredComponentRedemptionUnits(
+        ISetToken _setToken,
+        uint256 _quantity
+    )
+        external
+        view
+        virtual
+        returns (address[] memory, uint256[] memory)
+    {
+        return _calculateRequiredComponentIssuanceUnits(_setToken, totalQuantity, false);
+    }
+
+    /* ============ Internal Functions ============ */
+
+    function _calculateRequiredComponentIssuanceUnit (
+        ISetToken _setToken,
+        uint256 _quantity,
+        bool _isIssue
+    ) 
+        internal 
+        returns (address[] memory, uint256[] memory)
+    {
         address[] memory components = _setToken.getComponents();
 
         uint256[] memory notionalUnits = new uint256[](components.length);
 
         for (uint256 i = 0; i < components.length; i++) {
             require(!_setToken.hasExternalPosition(components[i]), "Only default positions are supported");
-
-            notionalUnits[i] = _setToken.getDefaultPositionRealUnit(components[i]).toUint256().preciseMulCeil(_quantity);
+            uint256 units = _setToken.getDefaultPositionRealUnit(components[i]).toUint256();
+            notionalUnits[i] = _isIssue ?
+                    units.preciseMulCeil(_quantity) :
+                    units.preciseMul(_quantity);
         }
 
         return (components, notionalUnits);
     }
 
-    /* ============ Internal Functions ============ */
-
     /**
      * If a pre-issue hook has been configured, call the external-protocol contract. Pre-issue hook logic
      * can contain arbitrary logic including validations, external function calls, etc.
      */
-    function _callPreIssueHooks(
+    function _callManagerPreIssueHooks(
         ISetToken _setToken,
         uint256 _quantity,
         address _caller,
@@ -237,12 +314,54 @@ contract BasicIssuanceModule is ModuleBase, ReentrancyGuard {
         internal
         returns(address)
     {
-        IManagerIssuanceHook preIssueHook = managerIssuanceHook[_setToken];
+        IManagerIssuanceHook preIssueHook = issuanceSettings[_setToken].managerIssuanceHook;
         if (address(preIssueHook) != address(0)) {
             preIssueHook.invokePreIssueHook(_setToken, _quantity, _caller, _to);
             return address(preIssueHook);
         }
 
         return address(0);
+    }
+
+    /**
+     * If a pre-redeem hook has been configured, call the external-protocol contract's pre-redeem function.
+     * Pre-issue hook logic can contain arbitrary logic including validations, external function calls, etc.
+     */
+    function _callManagerPreRedeemHooks(
+        ISetToken _setToken,
+        uint256 _quantity,
+        address _caller,
+        address _to
+    )
+        internal
+        returns(address)
+    {
+        IManagerIssuanceHook preIssueHook = issuanceSettings[_setToken].managerIssuanceHook;
+        if (address(preIssueHook) != address(0)) {
+            preIssueHook.invokePreRedeemHook(_setToken, _quantity, _caller, _to);
+            return address(preIssueHook);
+        }
+
+        return address(0);
+    }
+
+    /**
+     * Calls all modules that have registered with the DebtIssuanceModule that have a moduleIssueHook.
+     */
+    function _callModulePreIssueHooks(ISetToken _setToken, uint256 _quantity) internal {
+        address[] memory issuanceHooks = issuanceSettings[_setToken].moduleIssuanceHooks;
+        for (uint256 i = 0; i < issuanceHooks.length; i++) {
+            IModuleIssuanceHook(issuanceHooks[i]).moduleIssueHook(_setToken, _quantity);
+        }
+    }
+
+    /**
+     * Calls all modules that have registered with the DebtIssuanceModule that have a moduleRedeemHook.
+     */
+    function _callModulePreRedeemHooks(ISetToken _setToken, uint256 _quantity) internal {
+        address[] memory issuanceHooks = issuanceSettings[_setToken].moduleIssuanceHooks;
+        for (uint256 i = 0; i < issuanceHooks.length; i++) {
+            IModuleIssuanceHook(issuanceHooks[i]).moduleRedeemHook(_setToken, _quantity);
+        }
     }
 }
